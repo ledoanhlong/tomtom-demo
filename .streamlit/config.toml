@@ -1,0 +1,9 @@
+# .streamlit/config.toml
+[theme]
+base = "light"           # use Streamlit's light theme
+primaryColor = "#D30000" # your TomTom red
+
+# (optional) leave these out to keep default light colors
+# backgroundColor = "#FFFFFF"
+# secondaryBackgroundColor = "#F5F7FB"
+# textColor = "#0F172A"
