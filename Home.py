@@ -246,7 +246,7 @@ def chat_ui() -> None:
 
     st.title(APP_TITLE)
     st.markdown("---")
-    st.header("📖 Chat Assistant")
+    st.header("🗺️ Chat Assistant")
 
     st.markdown('<div class="chat-margin-container">', unsafe_allow_html=True)
 
