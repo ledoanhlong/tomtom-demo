@@ -144,152 +144,131 @@ def to_pf_chat_history(msgs: List[Dict[str, str]], max_pairs: int = 6) -> List[D
     return pairs[-max_pairs:]
 
 def get_llm_response(prompt: str) -> str:
-    """
-    Calls your endpoint robustly:
-    - Azure OpenAI (chat/completions): builds proper messages payload
-    - Azure AI / Prompt Flow / AML endpoints: tries multiple schemas
-    - Filters out known AML default sample text so it never reaches the user
-    """
     import json, requests
 
-    # --- sanity checks ---
     if not LLM_API_KEY or not LLM_ENDPOINT:
-        return "⚠️ Missing LLM configuration. Please set AZURE_API_KEY and AZURE_API_ENDPOINT."
+        return "⚠️ Missing LLM configuration. Set AZURE_API_KEY and AZURE_API_ENDPOINT."
 
+    # Heuristics: which auth header?
     endpoint_lower = LLM_ENDPOINT.lower()
-    is_aml = ".inference.ml.azure.com" in endpoint_lower
-    is_foundry = (".inference.azureai.io" in endpoint_lower) or ("ai.azure.com" in endpoint_lower)
-    is_aoai = ("openai.azure.com" in endpoint_lower) or ("/chat/completions" in endpoint_lower)
-
-    # --- headers ---
+    is_aml = ".inference.ml.azure.com" in endpoint_lower or LLM_ENDPOINT.rstrip("/").endswith("/score")
     headers = {"Content-Type": "application/json"}
     if is_aml:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
     else:
-        headers["api-key"] = LLM_API_KEY
+        headers["api-key"] = LLM_API_KEY  # Foundry / serverless
 
-    # --- build a lightweight chat history (Prompt Flow style pairs already exist) ---
+    # Build PF-style chat history (pairs)
     def pf_history():
-        hist = to_pf_chat_history(st.session_state.get(SK_MSGS, []))
-        return hist or [{"inputs": {"chat_input": "Hi"}, "outputs": {"chat_output": "Hello!"}}]
+        msgs = st.session_state.get(SK_MSGS, [])
+        pairs, cur = [], None
+        for m in msgs:
+            role = m.get("role"); text = (m.get("content") or "").strip()
+            if not text: continue
+            if role == "user":
+                cur = text
+            elif role == "assistant" and cur is not None:
+                pairs.append({"inputs": {"chat_input": cur}, "outputs": {"chat_output": text}})
+                cur = None
+        # If empty, seed with the flow's default greeting pair (matches your YAML)
+        if not pairs:
+            pairs = [{
+                "inputs": {"chat_input": "Hi"},
+                "outputs": {"chat_output": "Hello! How can I assist you today?"}
+            }]
+        return pairs
 
-    # --- helper: detect AML default sample output & suppress it ---
-    DEFAULT_SIGNATURES = [
+    # Known default/sample text detector
+    DEFAULT_SIGS = [
         "ml_client.compute.begin_create_or_update(compute_instance)",
         "from azure.ai.ml import mlclient",
         "from azure.ai.ml.entities import computeinstance",
-        "DefaultAzureCredential",
-        "Standard_DS3_v2",
+        "defaultazurecredential",
+        "standard_ds3_v2",
         "steps to create a compute instance",
         "stopping a compute instance",
     ]
-    def looks_like_default(text: str) -> bool:
-        t = (text or "").lower()
-        if len(t) < 60:
-            return False
-        hits = sum(sig.lower() in t for sig in DEFAULT_SIGNATURES)
-        aml_combo = (("compute instance" in t) and ("azureml" in t or "azure.ai.ml" in t))
-        return hits >= 2 or aml_combo
+    def looks_like_default(txt: str) -> bool:
+        t = (txt or "").lower()
+        if len(t) < 80: return False
+        hits = sum(sig in t for sig in DEFAULT_SIGS)
+        return hits >= 2 or ("compute instance" in t and ("azureml" in t or "azure.ai.ml" in t))
 
-    # --- 1) Azure OpenAI chat/completions path ---
-    if is_aoai:
-        # Build OpenAI-style messages from your session history
-        messages = []
-        # Optional system prompt
-        messages.append({"role": "system", "content": "You are a helpful assistant."})
-        for m in st.session_state.get(SK_MSGS, []):
-            role = m.get("role", "assistant")
-            content = (m.get("content") or "").strip()
-            if not content:
-                continue
-            if role not in ("user", "assistant", "system"):
-                role = "user" if role == "human" else "assistant"
-            messages.append({"role": role, "content": content})
-        # Add the new user prompt
-        messages.append({"role": "user", "content": prompt})
+    # Two canonical bodies per your flow spec
+    body_foundry = {
+        "inputs": {
+            "chat_input": prompt,
+            "chat_history": pf_history(),
+        }
+    }
+    body_aml = {
+        "input_data": {
+            "inputs": {
+                "chat_input": prompt,
+                "chat_history": pf_history(),
+            }
+        }
+    }
 
-        try:
-            resp = requests.post(LLM_ENDPOINT, headers=headers, json={"messages": messages, "temperature": 0.2}, timeout=90)
-            if resp.status_code != 200:
-                return f"⚠️ AOAI error {resp.status_code}: {resp.text[:500]}"
-            data = resp.json()
-            content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
-            return content or "⚠️ AOAI returned no content."
-        except Exception as e:
-            return f"⚠️ AOAI request failed: {e}"
-
-    # --- 2) Prompt Flow / AML schemas (try several) ---
-    payloads = [
-        # Foundry / AOAI serverless style (Prompt Flow)
-        ("foundry.inputs", {"inputs": {"chat_input": prompt, "chat_history": pf_history()}}),
-        # AML managed online endpoint with input_data.inputs
-        ("aml.input_data.inputs", {"input_data": {"inputs": {"chat_input": prompt, "chat_history": pf_history()}}}),
-        # Raw top-level fields some runtimes accept
-        ("raw.top", {"chat_input": prompt, "chat_history": pf_history()}),
-        # Some flows accept a simple input_string
-        ("aml.input_data.input_string", {"input_data": {"input_string": prompt}}),
-        # Some flows accept bare "input_string"
-        ("raw.input_string", {"input_string": prompt}),
+    tried = [
+        ("foundry.inputs", body_foundry),
+        ("aml.input_data.inputs", body_aml),
     ]
 
     last_status = None
     last_text = None
     last_tag = None
 
-    for tag, body in payloads:
+    for tag, body in tried:
         try:
             resp = requests.post(LLM_ENDPOINT, headers=headers, json=body, timeout=90)
             last_status, last_text, last_tag = resp.status_code, resp.text, tag
             if resp.status_code != 200:
                 continue
 
-            # Try JSON first
+            # Parse JSON and extract chat_output in common places
             try:
                 data = resp.json()
-                # common shapes
-                content = (
-                    (data.get("outputs") or {}).get("chat_output")
-                    or data.get("chat_output")
-                    or data.get("output")
-                    or data.get("prediction")
-                    or data.get("result")
-                    or data.get("value")
-                )
-                if not content:
-                    # stringify the whole object if no obvious field
-                    cand = json.dumps(data, ensure_ascii=False)[:4000]
-                    if cand and not looks_like_default(cand):
-                        return cand
-                    else:
-                        continue
-
-                # filter sample/default
-                if looks_like_default(content):
-                    continue
-
-                return content
-
-            except ValueError:
-                # Non-JSON response; use text
+            except Exception:
                 txt = (resp.text or "").strip()
                 if txt and not looks_like_default(txt):
                     return txt
                 else:
                     continue
 
+            # Typical shapes we see from PF endpoints:
+            content = (
+                (data.get("outputs") or {}).get("chat_output")
+                or data.get("chat_output")
+                or data.get("output")
+                or data.get("result")
+                or data.get("value")
+            )
+            if not content:
+                # Return a compact view for debugging (helps you see the real keys)
+                preview = json.dumps(data, ensure_ascii=False)[:800]
+                if not looks_like_default(preview):
+                    return preview
+                continue
+
+            if looks_like_default(content):
+                # fall through to try other schema
+                continue
+
+            return content
+
         except requests.RequestException as e:
-            last_text = f"Network error calling LLM: {e}"
+            last_text = f"Network error: {e}"
             continue
 
-    # --- If all schemas failed or looked like default ---
-    debug = f"[{last_tag}] HTTP {last_status}; First 300 chars:\n{(last_text or '')[:300]}"
+    # All schemas failed or produced the default sample
+    debug = f"[{last_tag}] HTTP {last_status}; Body (first 500 chars):\n{(last_text or '')[:500]}"
     return (
-        "⚠️ Your endpoint returned a default/sample response, which usually means the request body "
-        "schema didn’t match. Open your endpoint’s **Test** tab and copy the exact working request body, "
-        "then update `get_llm_response` to use that schema.\n\n"
-        + debug
+        "⚠️ The endpoint returned its built-in sample/default response. "
+        "This means the request body didn’t match the deployed flow’s expected schema.\n\n"
+        "➡️ Fix: Open the endpoint in Azure Studio → **Test** tab → run a test → click **View request** → "
+        "copy the exact JSON and adjust this function’s payload accordingly.\n\n" + debug
     )
-
 # ==========================
 # ❖ Markdown/HTML helpers  |
 # ==========================
