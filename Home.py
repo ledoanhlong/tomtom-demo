@@ -6,6 +6,7 @@ import os, json, base64, html, re, requests
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import streamlit as st
+import re
 
 # =======================
 # ❖ Config / Constants  |
@@ -336,6 +337,60 @@ if st.session_state.get("__go_country__") or st.query_params.get("country"):
 # ==========================
 # ❖ UI: Chat               |
 # ==========================
+import re
+
+def clean_llm_output(text: str, *, max_chars: int = 8000) -> str:
+    """
+    Normalizes/cleans LLM Markdown:
+    - Removes TL;DR banners and horizontal rules
+    - Collapses extra whitespace
+    - Strips code fences
+    - Flattens shouty headings to simple labels
+    - Normalizes bullets
+    - (optional) trims overly long responses
+    """
+    if not text:
+        return ""
+
+    t = text
+
+    # 1) Strip code fences (keep inner content)
+    t = re.sub(r"```(?:[\w-]+\n)?(.*?)```", r"\1", t, flags=re.DOTALL)
+
+    # 2) Remove TL;DR headers (variants)
+    t = re.sub(r"^\s*(\*{0,2}\s*TL;DR\s*:?\s*\*{0,2})\s*$", "", t, flags=re.IGNORECASE | re.MULTILINE)
+
+    # 3) Remove horizontal rules (---, ___, ***)
+    t = re.sub(r"^\s*([-*_])\1\1+\s*$", "", t, flags=re.MULTILINE)
+
+    # 4) Flatten loud section headings to simple labels (keep content that follows)
+    # e.g., "### **Actions**" -> "**Actions:**"
+    t = re.sub(r"^\s*#{1,6}\s*\*{0,2}([A-Za-z][\w\s/\-]+?)\*{0,2}\s*$",
+               lambda m: f"**{m.group(1).strip().rstrip(':')} :**",
+               t, flags=re.MULTILINE)
+
+    # Common section names: make them consistent
+    t = re.sub(r"\*\*\s*(What this means for you|Actions?|Risks?/Watch[- ]?outs?)\s*:\*\*",
+               lambda m: f"**{m.group(1).title()} :**", t, flags=re.IGNORECASE)
+
+    # 5) Normalize bullets (•, –, * -> -)
+    t = re.sub(r"^\s*[•–*]\s+", "- ", t, flags=re.MULTILINE)
+
+    # 6) Collapse 3+ newlines -> 2, strip trailing spaces
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = "\n".join(line.rstrip() for line in t.splitlines())
+
+    # 7) Optional length trim (don’t cut mid-sentence if possible)
+    if max_chars and len(t) > max_chars:
+        cut = t[:max_chars]
+        # try not to cut in the middle of a sentence
+        last_period = cut.rfind(". ")
+        if last_period > max_chars * 0.7:
+            cut = cut[:last_period+1]
+        t = cut + "\n\n*…truncated…*"
+
+    return t.strip()
+
 def chat_ui() -> None:
     render_sidebar_home()
 
@@ -360,6 +415,7 @@ def chat_ui() -> None:
 
         with st.spinner("Thinking…"):
             reply = get_llm_response(prompt.strip(), context_text)
+            reply = clean_llm_output(reply_raw)   # 👈 tidy the output
 
         st.session_state[SK_MSGS].append({"role": "assistant", "content": reply})
         if len(st.session_state[SK_MSGS]) > MAX_CONTEXT_MESSAGES:
