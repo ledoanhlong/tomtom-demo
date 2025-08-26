@@ -1,4 +1,5 @@
-# Home.py — Chat UI + Sidebar (logo → nav → search → tools), Light theme with TomTom red (#D30000)
+# Home.py — Chat UI + Sidebar (logo → nav → search → tools), Light theme + TomTom red
+# Robust Prompt Flow calling with strict filter for AML default "compute instance" sample output.
 
 from __future__ import annotations
 import os, json, base64, html, re, requests
@@ -13,7 +14,6 @@ APP_TITLE = "TomTom Tax Agent"
 APP_ICON = ".streamlit/TomTom-Logo.png"
 LOGO_PATH = Path(".streamlit/TomTom-Logo.png")
 
-# ---------- LLM Settings ----------
 LLM_API_KEY = os.getenv("AZURE_API_KEY", "")
 LLM_ENDPOINT = os.getenv("AZURE_API_ENDPOINT", "")
 
@@ -43,14 +43,14 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Minimal CSS, add TomTom red (#D30000) styling
+# Minimal CSS (keep light theme from .streamlit/config.toml; add TomTom red accents)
 st.markdown(
     """
     <style>
-      /* Hide default "Pages" nav */
+      /* Hide Streamlit's built-in Pages nav so our logo sits at the very top */
       [data-testid="stSidebarNav"], section[data-testid="stSidebar"] nav { display: none !important; }
 
-      /* Hide default chat avatars */
+      /* Optional: hide default chat avatars (we render our own emoji) */
       [data-testid="chatAvatarIcon-user"], [data-testid="chatAvatarIcon-assistant"] { display: none !important; }
 
       /* Chat margins */
@@ -59,35 +59,17 @@ st.markdown(
         .chat-margin-container { margin-left: 10px; margin-right: 10px; }
       }
 
-      /* --- TomTom red theme additions --- */
-      /* Sidebar section titles */
-      .css-1d391kg, .css-hby737, h3, h4 {
-        color: #D30000 !important;
-      }
-
-      /* Buttons */
+      /* TomTom red accents */
       .stButton>button {
         background-color: #D30000 !important;
         color: #fff !important;
         border: none !important;
         border-radius: 9999px !important;
       }
-      .stButton>button:hover {
-        filter: brightness(1.1);
-      }
-
-      /* Chat header underline */
-      hr {
-        border: none;
-        border-top: 2px solid #D30000 !important;
-        margin: 0.5em 0;
-      }
-
-      /* Scrollbar (optional branding) */
-      ::-webkit-scrollbar-thumb {
-        background: #D30000 !important;
-        border-radius: 4px;
-      }
+      .stButton>button:hover { filter: brightness(1.1); }
+      h3, h4 { color: #D30000 !important; }
+      hr { border: none; border-top: 2px solid #D30000 !important; margin: .5rem 0; }
+      ::-webkit-scrollbar-thumb { background: #D30000 !important; border-radius: 4px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -115,7 +97,7 @@ def show_logo(center: bool = True, max_width: str = "180px") -> None:
         )
 
 # ==========================
-# ❖ Country list & helpers |
+# ❖ Countries              |
 # ==========================
 COUNTRIES: List[Tuple[str, str]] = [
     ("Netherlands", "NL"), ("Belgium", "BE"), ("Germany", "DE"), ("France", "FR"),
@@ -129,95 +111,93 @@ def find_country_by_name(name: str) -> Optional[Tuple[str, str]]:
     return None
 
 # ==========================
-# ❖ Prompt Flow helpers / LLM (shortened for clarity) |
+# ❖ Prompt Flow helpers    |
 # ==========================
 def to_pf_chat_history(msgs: List[Dict[str, str]], max_pairs: int = 6) -> List[Dict]:
+    """Convert Streamlit chat history to Prompt Flow pairs."""
     pairs, cur_user = [], None
     for m in msgs:
         role = m.get("role")
         text = (m.get("content") or "").strip()
-        if not text: continue
-        if role == "user": cur_user = text
+        if not text:
+            continue
+        if role == "user":
+            cur_user = text
         elif role == "assistant" and cur_user is not None:
-            pairs.append({"inputs": {"chat_input": cur_user}, "outputs": {"chat_output": text}})
+            pairs.append({"inputs": {"chat_input": cur_user},
+                          "outputs": {"chat_output": text}})
             cur_user = None
+    if not pairs:
+        pairs = [{
+            "inputs": {"chat_input": "Hi"},
+            "outputs": {"chat_output": "Hello! How can I assist you today?"}
+        }]
     return pairs[-max_pairs:]
 
+# --- Strict detector for AML tutorial default output ---
+DEFAULT_SIGNATURES = [
+    "ml_client.compute.begin_create_or_update(compute_instance)",
+    "from azure.ai.ml import mlclient",
+    "from azure.ai.ml.entities import computeinstance",
+    "from azure.identity import defaultazurecredential",
+    "standard_ds3_v2",
+    "steps to create a compute instance",
+    "to create an azure machine learning compute instance",
+    "pip install azure-ai-ml",
+    "computeinstance(",
+    "begin_create_or_update(",
+    "compute instance '",
+    "azure machine learning workspace",
+    "vm size (e.g., standard_ds3_v2)",
+    "monitor the creation process",
+]
+def looks_like_default(text: str) -> bool:
+    """Return True if text smells like the AML 'create compute instance' tutorial."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if any(sig in t for sig in DEFAULT_SIGNATURES):
+        return True
+    # Common combos/tutorial markers
+    if ("compute instance" in t and ("azureml" in t or "azure.ai.ml" in t)):
+        return True
+    if "###" in t and "```" in t and "pip install azure-ai-ml" in t:
+        return True
+    return False
+
+# ==========================
+# ❖ LLM Call               |
+# ==========================
 def get_llm_response(prompt: str, context: str) -> str:
     """
     Robust caller for a Prompt Flow scoring endpoint that expects:
       inputs.chat_input (string) + inputs.chat_history (list of PF pairs)
     Tries:
       - URL as-is and with '/score'
-      - Bearer vs api-key auth (auto-fallback)
+      - Bearer vs api-key auth
       - Foundry-style vs AML-style request bodies
-    Filters AML's sample 'compute instance' blob.
+    Filters AML's sample 'compute instance' blob in ALL code paths.
     """
-    import json, requests
-
     if not LLM_API_KEY or not LLM_ENDPOINT:
         return "⚠️ Missing LLM configuration. Set AZURE_API_KEY and AZURE_API_ENDPOINT."
 
-    # --- Build PF-style chat history (pairs) ---
-    def pf_history():
-        msgs = st.session_state.get(SK_MSGS, [])
-        pairs, cur = [], None
-        for m in msgs:
-            role = m.get("role")
-            text = (m.get("content") or "").strip()
-            if not text:
-                continue
-            if role == "user":
-                cur = text
-            elif role == "assistant" and cur is not None:
-                pairs.append({"inputs": {"chat_input": cur}, "outputs": {"chat_output": text}})
-                cur = None
-        if not pairs:
-            # Seed with the exact greeting pair your YAML shows
-            pairs = [{
-                "inputs": {"chat_input": "Hi"},
-                "outputs": {"chat_output": "Hello! How can I assist you today?"}
-            }]
-        return pairs
+    endpoint = LLM_ENDPOINT.rstrip("/")
+    urls = [endpoint] + ([endpoint + "/score"] if not endpoint.endswith("/score") else [])
 
-    # --- AML default/sample detector ---
-    DEFAULT_SIGS = [
-        "ml_client.compute.begin_create_or_update(compute_instance)",
-        "from azure.ai.ml import mlclient",
-        "from azure.ai.ml.entities import computeinstance",
-        "defaultazurecredential",
-        "standard_ds3_v2",
-        "steps to create a compute instance",
-        "stopping a compute instance",
-    ]
-    def looks_like_default(txt: str) -> bool:
-        t = (txt or "").lower()
-        if len(t) < 60:
-            return False
-        hits = sum(sig in t for sig in DEFAULT_SIGS)
-        return hits >= 2 or ("compute instance" in t and ("azureml" in t or "azure.ai.ml" in t))
-
-    # --- Bodies that match your flow spec (from the YAML) ---
-    body_foundry = {"inputs": {"chat_input": prompt, "chat_history": pf_history()}}
-    body_aml = {"input_data": {"inputs": {"chat_input": prompt, "chat_history": pf_history()}}}
-
-    # --- Try URL variants (some AML endpoints require /score) ---
-    urls = [LLM_ENDPOINT.rstrip("/")]
-    if not urls[0].endswith("/score"):
-        urls.append(urls[0] + "/score")
-
-    # --- Try auth variants (some deployments changed auth recently) ---
     def bearer_headers():
         return {"Content-Type": "application/json", "Authorization": f"Bearer {LLM_API_KEY}"}
     def apikey_headers():
         return {"Content-Type": "application/json", "api-key": LLM_API_KEY}
 
-    headers_list = [bearer_headers(), apikey_headers()]  # try both, Bearer first (AML)
+    headers_list = [bearer_headers(), apikey_headers()]  # try both
 
-    # --- Try bodies in both schemas ---
-    payloads = [("foundry.inputs", body_foundry), ("aml.input_data.inputs", body_aml)]
+    history_pf = to_pf_chat_history(st.session_state.get(SK_MSGS, []))
 
-    last = {"where": None, "status": None, "text": None}
+    body_foundry = {"inputs": {"chat_input": prompt, "chat_history": history_pf}}
+    body_aml = {"input_data": {"inputs": {"chat_input": prompt, "chat_history": history_pf}}}
+    payloads = [("foundry.inputs", body_foundry), ("aml.input_data.inputs", body_aml), ("raw.top", {"chat_input": prompt, "chat_history": history_pf})]
+
+    last_status = last_text = last_where = None
 
     for url in urls:
         for headers in headers_list:
@@ -225,55 +205,57 @@ def get_llm_response(prompt: str, context: str) -> str:
                 where = f"{url} [{ 'Bearer' if 'Authorization' in headers else 'api-key' } | {tag}]"
                 try:
                     resp = requests.post(url, headers=headers, json=body, timeout=90)
-                    last.update({"where": where, "status": resp.status_code, "text": resp.text})
+                    last_status, last_text, last_where = resp.status_code, resp.text, where
                     if resp.status_code != 200:
                         continue
 
-                    # Parse JSON if possible
+                    # Try JSON first
                     try:
                         data = resp.json()
                     except Exception:
+                        # Non-JSON text
                         txt = (resp.text or "").strip()
-                        if txt and not looks_like_default(txt):
-                            return txt
-                        else:
+                        if txt and looks_like_default(txt):
                             continue
+                        if txt:
+                            return txt
+                        continue
 
-                    # Common PF output shapes
+                    # Extract content from common shapes
                     content = (
                         (data.get("outputs") or {}).get("chat_output")
                         or data.get("chat_output")
                         or data.get("output")
+                        or data.get("prediction")
                         or data.get("result")
                         or data.get("value")
                     )
-                    if not content:
-                        # Show compact preview to help debug true shape
-                        preview = json.dumps(data, ensure_ascii=False)[:800]
-                        if not looks_like_default(preview):
-                            return preview
-                        continue
+                    if content:
+                        if looks_like_default(content):
+                            continue
+                        return content
 
-                    if looks_like_default(content):
-                        # Try next combo; this is the AML sample
+                    # If no obvious field, stringify briefly for debug — but block default text
+                    cand = json.dumps(data, ensure_ascii=False)
+                    if cand and looks_like_default(cand):
                         continue
-
-                    return content
+                    if cand:
+                        return cand[:4000]
 
                 except requests.RequestException as e:
-                    last.update({"text": f"Network error: {e}"})
+                    last_text = f"Network error: {e}"
                     continue
 
-    # If we reach here, every combo either failed or produced the default sample
+    # All attempts failed or were blocked as default
+    debug = f"Last attempt: {last_where} → HTTP {last_status}\nBody (first 400 chars):\n{(last_text or '')[:400]}"
     return (
-        "⚠️ The endpoint is returning its sample/default output. That usually means the request "
-        "body schema or auth header doesn’t match.\n\n"
-        f"Last attempt: {last['where']} → HTTP {last['status']}\n"
-        f"Body (first 400 chars):\n{(last['text'] or '')[:400]}"
+        "⚠️ The endpoint responded with a sample/default output or an error. "
+        "This usually means the request schema or auth header doesn't match the deployed flow. "
+        "Open the endpoint's **Test** tab, run a test, click **View request**, and align the JSON.\n\n" + debug
     )
 
 # ==========================
-# ❖ Markdown/HTML helpers  |
+# ❖ Simple render helpers  |
 # ==========================
 def format_llm_reply_to_html(raw_text: str) -> str:
     return "<p>" + html.escape((raw_text or "").strip()).replace("\n", "<br>") + "</p>"
@@ -301,16 +283,18 @@ def render_chat_history(messages: List[Dict[str, str]]) -> None:
 # ==========================
 def render_sidebar_home() -> None:
     with st.sidebar:
+        # 1) Logo
         show_logo(center=True, max_width="180px")
 
+        # 2) Navigation
         st.markdown("### Navigation")
         try:
             st.page_link("Home.py", label="🏠 Chat", icon=None)
         except Exception:
             st.write("• Chat")
-
         st.markdown("---")
 
+        # 3) Country search
         st.markdown("#### Country search")
         country_name = st.selectbox(
             "Search or select a country",
@@ -324,13 +308,14 @@ def render_sidebar_home() -> None:
                 n, iso = selected
                 st.session_state["selected_country_name"] = n
                 st.session_state["selected_country_iso"] = iso
-                st.query_params.clear(); st.query_params["country"] = iso
+                st.query_params.clear()
+                st.query_params["country"] = iso
                 st.session_state["__go_country__"] = True
                 st.rerun()
 
         st.markdown("---")
 
-        # 🔴 Clear Conversation button (TomTom red via CSS)
+        # 4) Tools — Clear conversation (TomTom red via CSS above)
         if st.button("Clear conversation", use_container_width=True):
             st.session_state[SK_MSGS] = [
                 {"role": "assistant", "content": "Hi! I am an AI model trained on RSM Data. How can I help today?"}
@@ -341,9 +326,10 @@ def render_sidebar_home() -> None:
 # ❖ Top-level redirect guard
 # ==========================
 if st.session_state.get("__go_country__") or st.query_params.get("country"):
-    if "__go_country__" in st.session_state: del st.session_state["__go_country__"]
+    if "__go_country__" in st.session_state:
+        del st.session_state["__go_country__"]
     try:
-        st.switch_page("pages/_Country.py")  # hidden file
+        st.switch_page("pages/_Country.py")
     except Exception:
         st.rerun()
 
@@ -355,7 +341,7 @@ def chat_ui() -> None:
 
     st.title(APP_TITLE)
     st.markdown("---")
-    st.header("🗺️ Chat Assistant")
+    st.header("📖 Chat Assistant")
 
     st.markdown('<div class="chat-margin-container">', unsafe_allow_html=True)
 
@@ -369,8 +355,12 @@ def chat_ui() -> None:
     prompt = st.chat_input("Type your message and press enter", key="chat_prompt")
     if prompt and prompt.strip():
         st.session_state[SK_MSGS].append({"role": "user", "content": prompt.strip()})
+        recent = st.session_state[SK_MSGS][-MAX_CONTEXT_MESSAGES:]
+        context_text = "\n".join(f"{m['role']}: {m['content']}" for m in recent)
+
         with st.spinner("Thinking…"):
-            reply = get_llm_response(prompt.strip(), context_text)  # ← pass BOTH
+            reply = get_llm_response(prompt.strip(), context_text)
+
         st.session_state[SK_MSGS].append({"role": "assistant", "content": reply})
         if len(st.session_state[SK_MSGS]) > MAX_CONTEXT_MESSAGES:
             st.session_state[SK_MSGS] = st.session_state[SK_MSGS][-MAX_CONTEXT_MESSAGES:]
