@@ -337,8 +337,6 @@ if st.session_state.get("__go_country__") or st.query_params.get("country"):
 # ==========================
 # ❖ UI: Chat               |
 # ==========================
-import re
-
 def clean_llm_output(text: str, *, max_chars: int = 8000) -> str:
     """
     Normalizes/cleans LLM Markdown:
@@ -414,7 +412,7 @@ def chat_ui() -> None:
         context_text = "\n".join(f"{m['role']}: {m['content']}" for m in recent)
 
         with st.spinner("Thinking…"):
-            reply = get_llm_response(prompt.strip(), context_text)
+            reply_raw = get_llm_response(prompt.strip(), context_text)
             reply = clean_llm_output(reply_raw)   # 👈 tidy the output
 
         st.session_state[SK_MSGS].append({"role": "assistant", "content": reply})
