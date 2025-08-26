@@ -143,42 +143,44 @@ def to_pf_chat_history(msgs: List[Dict[str, str]], max_pairs: int = 6) -> List[D
             cur_user = None
     return pairs[-max_pairs:]
 
-def get_llm_response(prompt: str) -> str:
+def get_llm_response(prompt: str, context: str) -> str:
+    """
+    Robust caller for a Prompt Flow scoring endpoint that expects:
+      inputs.chat_input (string) + inputs.chat_history (list of PF pairs)
+    Tries:
+      - URL as-is and with '/score'
+      - Bearer vs api-key auth (auto-fallback)
+      - Foundry-style vs AML-style request bodies
+    Filters AML's sample 'compute instance' blob.
+    """
     import json, requests
 
     if not LLM_API_KEY or not LLM_ENDPOINT:
         return "⚠️ Missing LLM configuration. Set AZURE_API_KEY and AZURE_API_ENDPOINT."
 
-    # Heuristics: which auth header?
-    endpoint_lower = LLM_ENDPOINT.lower()
-    is_aml = ".inference.ml.azure.com" in endpoint_lower or LLM_ENDPOINT.rstrip("/").endswith("/score")
-    headers = {"Content-Type": "application/json"}
-    if is_aml:
-        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
-    else:
-        headers["api-key"] = LLM_API_KEY  # Foundry / serverless
-
-    # Build PF-style chat history (pairs)
+    # --- Build PF-style chat history (pairs) ---
     def pf_history():
         msgs = st.session_state.get(SK_MSGS, [])
         pairs, cur = [], None
         for m in msgs:
-            role = m.get("role"); text = (m.get("content") or "").strip()
-            if not text: continue
+            role = m.get("role")
+            text = (m.get("content") or "").strip()
+            if not text:
+                continue
             if role == "user":
                 cur = text
             elif role == "assistant" and cur is not None:
                 pairs.append({"inputs": {"chat_input": cur}, "outputs": {"chat_output": text}})
                 cur = None
-        # If empty, seed with the flow's default greeting pair (matches your YAML)
         if not pairs:
+            # Seed with the exact greeting pair your YAML shows
             pairs = [{
                 "inputs": {"chat_input": "Hi"},
                 "outputs": {"chat_output": "Hello! How can I assist you today?"}
             }]
         return pairs
 
-    # Known default/sample text detector
+    # --- AML default/sample detector ---
     DEFAULT_SIGS = [
         "ml_client.compute.begin_create_or_update(compute_instance)",
         "from azure.ai.ml import mlclient",
@@ -190,85 +192,86 @@ def get_llm_response(prompt: str) -> str:
     ]
     def looks_like_default(txt: str) -> bool:
         t = (txt or "").lower()
-        if len(t) < 80: return False
+        if len(t) < 60:
+            return False
         hits = sum(sig in t for sig in DEFAULT_SIGS)
         return hits >= 2 or ("compute instance" in t and ("azureml" in t or "azure.ai.ml" in t))
 
-    # Two canonical bodies per your flow spec
-    body_foundry = {
-        "inputs": {
-            "chat_input": prompt,
-            "chat_history": pf_history(),
-        }
-    }
-    body_aml = {
-        "input_data": {
-            "inputs": {
-                "chat_input": prompt,
-                "chat_history": pf_history(),
-            }
-        }
-    }
+    # --- Bodies that match your flow spec (from the YAML) ---
+    body_foundry = {"inputs": {"chat_input": prompt, "chat_history": pf_history()}}
+    body_aml = {"input_data": {"inputs": {"chat_input": prompt, "chat_history": pf_history()}}}
 
-    tried = [
-        ("foundry.inputs", body_foundry),
-        ("aml.input_data.inputs", body_aml),
-    ]
+    # --- Try URL variants (some AML endpoints require /score) ---
+    urls = [LLM_ENDPOINT.rstrip("/")]
+    if not urls[0].endswith("/score"):
+        urls.append(urls[0] + "/score")
 
-    last_status = None
-    last_text = None
-    last_tag = None
+    # --- Try auth variants (some deployments changed auth recently) ---
+    def bearer_headers():
+        return {"Content-Type": "application/json", "Authorization": f"Bearer {LLM_API_KEY}"}
+    def apikey_headers():
+        return {"Content-Type": "application/json", "api-key": LLM_API_KEY}
 
-    for tag, body in tried:
-        try:
-            resp = requests.post(LLM_ENDPOINT, headers=headers, json=body, timeout=90)
-            last_status, last_text, last_tag = resp.status_code, resp.text, tag
-            if resp.status_code != 200:
-                continue
+    headers_list = [bearer_headers(), apikey_headers()]  # try both, Bearer first (AML)
 
-            # Parse JSON and extract chat_output in common places
-            try:
-                data = resp.json()
-            except Exception:
-                txt = (resp.text or "").strip()
-                if txt and not looks_like_default(txt):
-                    return txt
-                else:
+    # --- Try bodies in both schemas ---
+    payloads = [("foundry.inputs", body_foundry), ("aml.input_data.inputs", body_aml)]
+
+    last = {"where": None, "status": None, "text": None}
+
+    for url in urls:
+        for headers in headers_list:
+            for tag, body in payloads:
+                where = f"{url} [{ 'Bearer' if 'Authorization' in headers else 'api-key' } | {tag}]"
+                try:
+                    resp = requests.post(url, headers=headers, json=body, timeout=90)
+                    last.update({"where": where, "status": resp.status_code, "text": resp.text})
+                    if resp.status_code != 200:
+                        continue
+
+                    # Parse JSON if possible
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        txt = (resp.text or "").strip()
+                        if txt and not looks_like_default(txt):
+                            return txt
+                        else:
+                            continue
+
+                    # Common PF output shapes
+                    content = (
+                        (data.get("outputs") or {}).get("chat_output")
+                        or data.get("chat_output")
+                        or data.get("output")
+                        or data.get("result")
+                        or data.get("value")
+                    )
+                    if not content:
+                        # Show compact preview to help debug true shape
+                        preview = json.dumps(data, ensure_ascii=False)[:800]
+                        if not looks_like_default(preview):
+                            return preview
+                        continue
+
+                    if looks_like_default(content):
+                        # Try next combo; this is the AML sample
+                        continue
+
+                    return content
+
+                except requests.RequestException as e:
+                    last.update({"text": f"Network error: {e}"})
                     continue
 
-            # Typical shapes we see from PF endpoints:
-            content = (
-                (data.get("outputs") or {}).get("chat_output")
-                or data.get("chat_output")
-                or data.get("output")
-                or data.get("result")
-                or data.get("value")
-            )
-            if not content:
-                # Return a compact view for debugging (helps you see the real keys)
-                preview = json.dumps(data, ensure_ascii=False)[:800]
-                if not looks_like_default(preview):
-                    return preview
-                continue
-
-            if looks_like_default(content):
-                # fall through to try other schema
-                continue
-
-            return content
-
-        except requests.RequestException as e:
-            last_text = f"Network error: {e}"
-            continue
-
-    # All schemas failed or produced the default sample
-    debug = f"[{last_tag}] HTTP {last_status}; Body (first 500 chars):\n{(last_text or '')[:500]}"
+    # If we reach here, every combo either failed or produced the default sample
     return (
-        "⚠️ The endpoint returned its built-in sample/default response. "
-        "This means the request body didn’t match the deployed flow’s expected schema.\n\n"
-        "➡️ Fix: Open the endpoint in Azure Studio → **Test** tab → run a test → click **View request** → "
-        "copy the exact JSON and adjust this function’s payload accordingly.\n\n" + debug
+        "⚠️ The endpoint is returning its sample/default output. That usually means the request "
+        "body schema or auth header doesn’t match.\n\n"
+        f"Last attempt: {last['where']} → HTTP {last['status']}\n"
+        f"Body (first 400 chars):\n{(last['text'] or '')[:400]}"
     )
+
 # ==========================
 # ❖ Markdown/HTML helpers  |
 # ==========================
@@ -367,7 +370,7 @@ def chat_ui() -> None:
     if prompt and prompt.strip():
         st.session_state[SK_MSGS].append({"role": "user", "content": prompt.strip()})
         with st.spinner("Thinking…"):
-            reply = get_llm_response(prompt.strip())
+            reply = get_llm_response(prompt.strip(), context_text)  # ← pass BOTH
         st.session_state[SK_MSGS].append({"role": "assistant", "content": reply})
         if len(st.session_state[SK_MSGS]) > MAX_CONTEXT_MESSAGES:
             st.session_state[SK_MSGS] = st.session_state[SK_MSGS][-MAX_CONTEXT_MESSAGES:]
