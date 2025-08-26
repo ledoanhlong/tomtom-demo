@@ -319,7 +319,7 @@ def render_sidebar_home() -> None:
         # 4) Tools — Clear conversation (TomTom red via CSS above)
         if st.button("Clear conversation", use_container_width=True):
             st.session_state[SK_MSGS] = [
-                {"role": "assistant", "content": "Hi! I am an AI model trained on RSM Data. How can I help today?"}
+                {"role": "assistant", "content": "Hi! I am TomTom's Tax Asisstant. How can I help today?"}
             ]
             st.rerun()
 
@@ -402,7 +402,7 @@ def chat_ui() -> None:
 
     st.session_state.setdefault(
         SK_MSGS,
-        [{"role": "assistant", "content": "Hi! I am an AI model trained on RSM Data. How can I help today?"}],
+        [{"role": "assistant", "content": "Hi! I am I am TomTom's Tax Asisstant. How can I help today?"}],
     )
 
     render_chat_history(st.session_state[SK_MSGS])
