@@ -24,8 +24,8 @@ SK_MSGS = "messages"
 ATTACH_CTX_KEY = "attachment_contexts"
 KB_STATE_KEY = "BASE_KB_CHUNKS"   # preloaded local KB chunks
 
-MAX_CONTEXT_MESSAGES = 12
-PF_MAX_TURNS = 6
+MAX_CONTEXT_MESSAGES = 20
+PF_MAX_TURNS = 10
 
 # =======================
 # ❖ Bootstrap KB (local)
