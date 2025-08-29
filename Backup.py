@@ -1,3 +1,9 @@
+# Home.py — TomTom Tax Agent (light theme)
+# - Prompt Flow schema: {"inputs":{"question":..., "chat_history":[...]} }
+# - Chat history pairs: {"inputs":{"question":...}, "outputs":{"answer":...}}
+# - Context injection order per call: KB_CONTEXT (local kb/), ATTACHMENT_CONTEXT (uploads), USER_QUESTION
+# - Bottom "➕ Attach" popover (not sidebar). User messages right-aligned.
+
 from __future__ import annotations
 import os, json, base64, html, re, requests, mimetypes
 from pathlib import Path
@@ -129,20 +135,6 @@ def show_logo(center: bool = True, max_width: str = "180px") -> None:
         )
 
 # =======================
-# ❖ Countries (sidebar)
-# =======================
-COUNTRIES: List[Tuple[str, str]] = [
-    ("Netherlands", "NL"), ("Belgium", "BE"), ("Germany", "DE"), ("France", "FR"),
-    ("United Kingdom", "GB"), ("Spain", "ES"), ("Italy", "IT"), ("Poland", "PL"),
-    ("United States", "US"), ("Canada", "CA"),
-]
-def find_country_by_name(name: str) -> Optional[Tuple[str, str]]:
-    for n, c in COUNTRIES:
-        if n == name:
-            return (n, c)
-    return None
-
-# =======================
 # ❖ PF chat history (question/answer pairs)
 # =======================
 def to_pf_chat_history(streamlit_msgs: List[Dict[str, str]], max_pairs: int = PF_MAX_TURNS) -> List[Dict]:
@@ -259,6 +251,7 @@ def _pptx_to_text(b: bytes) -> str:
         return ""
 
 def _rtf_to_text(b: bytes) -> str:
+    # naive fallback: strip RTF control words
     t = _bytes_to_text(b)
     t = re.sub(r"\\[a-zA-Z]+\d*", "", t)
     t = re.sub(r"[{}]", "", t)
@@ -266,7 +259,7 @@ def _rtf_to_text(b: bytes) -> str:
 
 def _html_to_text(b: bytes) -> str:
     try:
-        from bs4 import BeautifulSoup
+        from bs4 import BeautifulSoup  # optional if installed
         soup = BeautifulSoup(_bytes_to_text(b), "html.parser")
         return soup.get_text("\n")
     except Exception:
@@ -318,6 +311,7 @@ def extract_text_from_upload(uploaded_file) -> str:
     elif name.endswith((".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff")):
         text = _image_to_text(data) or f"[Image uploaded: {uploaded_file.name}]"
     else:
+        # best-effort based on mimetype
         guessed, _ = mimetypes.guess_type(name)
         if guessed and "text" in guessed:
             text = _bytes_to_text(data)
@@ -356,6 +350,7 @@ def read_local_file_to_text(path: Path) -> str:
         data = path.read_bytes()
     except Exception:
         return ""
+    # reuse same logic as uploads
     fake_uploaded = type("F", (), {"name": path.name, "read": lambda self=None: data, "getvalue": lambda self=None: data})
     return extract_text_from_upload(fake_uploaded)
 
@@ -377,6 +372,7 @@ def build_bootstrap_kb(dir_path: str) -> List[str]:
         except Exception:
             continue
 
+    # safety cap
     joined = "\n\n".join(chunks)
     if len(joined) > MAX_BOOTSTRAP_TOTAL_CHARS:
         joined = joined[:MAX_BOOTSTRAP_TOTAL_CHARS] + "\n...[KB truncated]"
@@ -625,60 +621,23 @@ def render_chat_history(messages: List[Dict[str, str]]) -> None:
             )
 
 # =======================
-# ❖ Sidebar (logo → nav → country search → tools)
+# ❖ Sidebar (logo + clear)
 # =======================
 def render_sidebar_home() -> None:
     with st.sidebar:
-        # 1) Logo
         show_logo(center=True, max_width="180px")
-
-        # 2) Navigation
         st.markdown("### Navigation")
         try:
             st.page_link("Home.py", label="🏠 Chat", icon=None)
-            st.page_link("pages/Support.py", label="❓ Support", icon=None)
         except Exception:
             st.write("• Chat")
         st.markdown("---")
 
-        # 3) Country search
-        st.markdown("#### Country search")
-        country_name = st.selectbox(
-            "Search or select a country",
-            options=[n for n, _ in COUNTRIES],
-            index=None,
-            placeholder="Type to search…",
-        )
-        if country_name:
-            selected = find_country_by_name(country_name)
-            if selected:
-                n, iso = selected
-                st.session_state["selected_country_name"] = n
-                st.session_state["selected_country_iso"] = iso
-                st.query_params.clear()
-                st.query_params["country"] = iso
-                st.session_state["__go_country__"] = True
-                st.rerun()
-
-        st.markdown("---")
-
-        # 4) Tools — Clear conversation
         if st.button("Clear conversation", use_container_width=True):
             st.session_state[SK_MSGS] = [
                 {"role": "assistant", "content": "Hi! I am TomTom's Tax Assistant. How can I help today?"}
             ]
             st.rerun()
-
-# =======================
-# ❖ Top-level redirect guard
-# =======================
-if st.session_state.get("__go_country__") or st.query_params.get("country"):
-    if "__go_country__" in st.session_state:
-        del st.session_state["__go_country__"]
-    try:
-        st.switch_page("pages/_Country.py")
-    except Exception:
-        st.rerun()
 
 # =======================
 # ❖ Chat UI
